@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
+	"reflect"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -251,7 +252,7 @@ func TestQueuedRequestCannotPublishAfterExpiration(t *testing.T) {
 			p.Request.Tags[i][1] = strconv.FormatInt(time.Now().Unix()+1, 10)
 		}
 	}
-	p.Request.Sign(c.secret)
+	p.Request.Sign(c.connectionSecret())
 	for range cap(c.active) {
 		c.active <- struct{}{}
 	}
@@ -269,13 +270,34 @@ func TestQueuedRequestCannotPublishAfterExpiration(t *testing.T) {
 }
 func TestClientFormattingCannotExposeConnectionSecret(t *testing.T) {
 	c, _ := fixture(t)
-	for _, format := range []string{"%v", "%+v", "%#v"} {
-		s := fmt.Sprintf(format, c)
-		if strings.Contains(s, c.secret) {
-			t.Fatal("client formatting exposes connection secret")
+	const marker = "synthetic-nwc-connection-secret-marker"
+	c.secret = ptr(marker)
+
+	// Reflection lets this exercise value formatting without a statically
+	// visible copy of Client.mu, which vet correctly rejects (copylocks).
+	value := reflect.ValueOf(c).Elem().Interface()
+	for _, shape := range []struct {
+		name string
+		v    any
+	}{
+		{"pointer", c},
+		{"value", value},
+	} {
+		for _, format := range []string{"%v", "%+v", "%#v", "%s", "%q"} {
+			t.Run(shape.name+"/"+format, func(t *testing.T) {
+				formatted := fmt.Sprintf(format, shape.v)
+				if strings.Contains(formatted, marker) {
+					t.Fatalf("client formatting exposes connection secret: %s", formatted)
+				}
+				if shape.name == "pointer" && !strings.Contains(formatted, "connection redacted") {
+					t.Fatalf("pointer formatting lost its redaction marker: %s", formatted)
+				}
+			})
 		}
 	}
 }
+
+func ptr[T any](v T) *T { return &v }
 
 func TestLegacyEncryptionRequiresExplicitChoice(t *testing.T) {
 	c, tr := fixture(t)
