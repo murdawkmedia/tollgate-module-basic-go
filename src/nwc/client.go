@@ -39,16 +39,19 @@ func (Config) String() string   { return "NWC configuration (connection redacted
 func (Config) GoString() string { return "NWC configuration (connection redacted)" }
 
 type Client struct {
-	mu                     sync.Mutex
-	wallet, public, secret string
-	relays                 []string
-	timeout                time.Duration
-	legacy                 bool
-	transport              Transport
-	info                   Info
-	encryption             string
-	used                   map[string]int64
-	active                 chan struct{}
+	mu sync.Mutex
+	// The secret is indirected so formatting a Client value cannot print it.
+	// String/GoString stay on *Client because a value receiver would copy mu.
+	wallet, public string
+	secret         *string
+	relays         []string
+	timeout        time.Duration
+	legacy         bool
+	transport      Transport
+	info           Info
+	encryption     string
+	used           map[string]int64
+	active         chan struct{}
 }
 type Info struct {
 	Network string   `json:"network"`
@@ -158,11 +161,19 @@ func New(cfg Config) (*Client, error) {
 	if tr == nil {
 		tr = RelayTransport{}
 	}
-	return &Client{wallet: u.Host, public: pub, secret: secret, relays: append([]string(nil), relays...), timeout: timeout, legacy: cfg.AllowLegacyNIP04, transport: tr, used: make(map[string]int64), active: make(chan struct{}, 4)}, nil
+	return &Client{wallet: u.Host, public: pub, secret: &secret, relays: append([]string(nil), relays...), timeout: timeout, legacy: cfg.AllowLegacyNIP04, transport: tr, used: make(map[string]int64), active: make(chan struct{}, 4)}, nil
 }
+
+func (c *Client) connectionSecret() string {
+	if c.secret == nil {
+		return ""
+	}
+	return *c.secret
+}
+
 func (c *Client) crypt(s, enc string, decrypt bool) (string, error) {
 	if enc == "nip44_v2" {
-		key, e := nip44.GenerateConversationKey(c.wallet, c.secret)
+		key, e := nip44.GenerateConversationKey(c.wallet, c.connectionSecret())
 		if e != nil {
 			return "", refused("encryption")
 		}
@@ -172,7 +183,7 @@ func (c *Client) crypt(s, enc string, decrypt bool) (string, error) {
 		return nip44.Encrypt(s, key)
 	}
 	if enc == "nip04" && c.legacy {
-		key, e := nip04.ComputeSharedSecret(c.wallet, c.secret)
+		key, e := nip04.ComputeSharedSecret(c.wallet, c.connectionSecret())
 		if e != nil {
 			return "", refused("encryption")
 		}
@@ -314,7 +325,7 @@ func (c *Client) prepareLocked(method string, params any, enc string) (Prepared,
 	}
 	expiry := time.Now().Add(c.timeout).Unix() + 1
 	event := nostr.Event{Kind: 23194, CreatedAt: nostr.Now(), Content: encrypted, Tags: nostr.Tags{{"p", c.wallet}, {"encryption", enc}, {"expiration", strconv.FormatInt(expiry, 10)}}}
-	if e = event.Sign(c.secret); e != nil {
+	if e = event.Sign(c.connectionSecret()); e != nil {
 		return Prepared{}, refused("signing")
 	}
 	return Prepared{event, method}, nil
@@ -445,5 +456,8 @@ func (c *Client) Execute(ctx context.Context, p Prepared) (json.RawMessage, erro
 	return c.exchange(ctx, p, enc)
 }
 
+// String and GoString deliberately use a pointer receiver: a value receiver
+// would copy Client.mu and be rejected by vet's copylocks check. The secret is
+// indirected instead, so a copied Client value cannot expose it either.
 func (*Client) String() string   { return "NWC client (connection redacted)" }
 func (*Client) GoString() string { return "NWC client (connection redacted)" }
