@@ -85,6 +85,7 @@ type Payment struct {
 	FeeMSat        int64  `json:"fee"`
 	Status         string `json:"status"`
 	Preimage       string `json:"preimage"`
+	ExternalID     string `json:"external_id"`
 }
 
 func (p Payment) Settled() bool { return p.Status == "success" }
@@ -134,6 +135,9 @@ func validHash(s string) bool {
 	return e == nil && len(b) == 32 && s == strings.ToLower(s)
 }
 func (c *Client) request(ctx context.Context, method, path, key string, input, out any) error {
+	return c.requestQuery(ctx, method, path, nil, key, input, out)
+}
+func (c *Client) requestQuery(ctx context.Context, method, path string, query url.Values, key string, input, out any) error {
 	var body io.Reader
 	if input != nil {
 		b, e := json.Marshal(input)
@@ -144,6 +148,9 @@ func (c *Client) request(ctx context.Context, method, path, key string, input, o
 	}
 	u := c.base
 	u.Path += path
+	if len(query) > 0 {
+		u.RawQuery = query.Encode()
+	}
 	req, e := http.NewRequestWithContext(ctx, method, u.String(), body)
 	if e != nil {
 		return refusal("invalid-request")
@@ -291,13 +298,45 @@ func (c *Client) CreateInvoice(ctx context.Context, r InvoiceRequest) (Payment, 
 	if e := c.request(ctx, "POST", "/api/v1/payments", c.invoiceKey, input, &p); e != nil {
 		return p, e
 	}
-	if e := c.validate(&p, p.PaymentHash, Incoming); e != nil || p.AmountMSat != int64(r.AmountSat*1000) {
+	if e := c.validate(&p, p.PaymentHash, Incoming); e != nil || p.AmountMSat != int64(r.AmountSat*1000) || p.ExternalID != r.ExternalID {
 		return Payment{}, &Error{Code: "invoice-binding", Unknown: true}
 	}
 	if _, e := c.decodeInvoice(p.BOLT11, true); e != nil {
 		return Payment{}, &Error{Code: "invoice-expired", Unknown: true}
 	}
 	return p, nil
+}
+
+// LookupExternalID recovers exactly one wallet-bound payment previously sent
+// with externalID. It is a read-only operation intended for reconciliation
+// after a create/pay response was lost; it never submits a payment.
+func (c *Client) LookupExternalID(ctx context.Context, externalID string, d Direction) (Payment, error) {
+	if !validID(externalID) || (d != Incoming && d != Outgoing) {
+		return Payment{}, refusal("invalid-external-id-lookup")
+	}
+	var payments []Payment
+	query := url.Values{"external_id": {externalID}, "limit": {"2"}}
+	if e := c.requestQuery(ctx, "GET", "/api/v1/payments", query, c.invoiceKey, nil, &payments); e != nil {
+		return Payment{}, e
+	}
+	var matches []Payment
+	for _, payment := range payments {
+		if payment.ExternalID != externalID {
+			continue
+		}
+		if e := c.validate(&payment, payment.PaymentHash, d); e != nil {
+			continue
+		}
+		matches = append(matches, payment)
+	}
+	switch len(matches) {
+	case 0:
+		return Payment{}, refusal("external-id-not-found")
+	case 1:
+		return matches[0], nil
+	default:
+		return Payment{}, refusal("external-id-ambiguous")
+	}
 }
 func (c *Client) Lookup(ctx context.Context, hash string, d Direction) (Payment, error) {
 	if !validHash(hash) || (d != Incoming && d != Outgoing) {
@@ -345,7 +384,7 @@ func (c *Client) PayInvoice(ctx context.Context, bolt, externalID string) (Payme
 	if e = c.request(ctx, "POST", "/api/v1/payments", c.adminKey, input, &p); e != nil {
 		return p, e
 	}
-	if e = c.validate(&p, inv.PaymentHash, Outgoing); e != nil {
+	if e = c.validate(&p, inv.PaymentHash, Outgoing); e != nil || p.ExternalID != externalID {
 		return Payment{}, &Error{Code: "payment-binding", Unknown: true}
 	}
 	return p, nil
