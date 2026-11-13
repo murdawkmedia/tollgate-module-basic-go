@@ -60,8 +60,12 @@ func walletJSON(w http.ResponseWriter) {
 func invoiceWalletJSON(w http.ResponseWriter) {
 	fmt.Fprint(w, `{"name":"test wallet","balance":4321}`)
 }
-func paymentJSON(bolt, hash, pre, status string, amount int64) map[string]any {
-	return map[string]any{"wallet_id": "wallet-a", "payment_hash": hash, "checking_id": "internal_" + hash, "bolt11": bolt, "payment_request": bolt, "amount": amount, "status": status, "preimage": pre, "fee": -5}
+func paymentJSON(bolt, hash, pre, status string, amount int64, externalID ...string) map[string]any {
+	external := "purchase-1"
+	if len(externalID) > 0 {
+		external = externalID[0]
+	}
+	return map[string]any{"wallet_id": "wallet-a", "payment_hash": hash, "checking_id": "internal_" + hash, "bolt11": bolt, "payment_request": bolt, "amount": amount, "status": status, "preimage": pre, "fee": -5, "external_id": external}
 }
 func TestReceiveAndLookupBoundToWallet(t *testing.T) {
 	bolt, hash, pre := testInvoice(t, 21000)
@@ -94,8 +98,8 @@ func TestReceiveAndLookupBoundToWallet(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if inv.PaymentHash != hash || inv.AmountMSat != 21000 {
-		t.Fatal("wrong invoice")
+	if inv.PaymentHash != hash || inv.AmountMSat != 21000 || inv.ExternalID != "purchase-1" {
+		t.Fatal("wrong invoice or external-id binding")
 	}
 	paid, err := c.Lookup(context.Background(), hash, Incoming)
 	if err != nil {
@@ -146,8 +150,8 @@ func TestInvoiceKeyWalletOmittingIDSucceeds(t *testing.T) {
 	if err != nil {
 		t.Fatalf("receive-only invoice refused: %v", err)
 	}
-	if inv.PaymentHash != hash || inv.AmountMSat != 21000 {
-		t.Fatal("wrong invoice")
+	if inv.PaymentHash != hash || inv.AmountMSat != 21000 || inv.ExternalID != "purchase-1" {
+		t.Fatal("wrong invoice or external-id binding")
 	}
 	if posts.Load() != 1 {
 		t.Fatal("invoice POST duplicated")
@@ -271,7 +275,7 @@ func TestSendSettlesAndChecksWalletBeforePosting(t *testing.T) {
 		if q["out"] != true || q["bolt11"] != bolt || q["external_id"] != "payout-1" {
 			t.Error("wrong send")
 		}
-		json.NewEncoder(w).Encode(paymentJSON(bolt, hash, pre, "success", -21000))
+		json.NewEncoder(w).Encode(paymentJSON(bolt, hash, pre, "success", -21000, "payout-1"))
 	})
 	p, err := c.PayInvoice(context.Background(), bolt, "payout-1")
 	if err != nil {
@@ -392,6 +396,109 @@ func TestReceiveOnlyCannotSpendAndOverflowNeverCallsServer(t *testing.T) {
 		t.Fatal("invalid request reached provider")
 	}
 }
+func TestCreateInvoiceExternalIDMismatchIsUnknown(t *testing.T) {
+	bolt, hash, _ := testInvoice(t, 21000)
+	var posts atomic.Int32
+	c, _ := testClient(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet {
+			invoiceWalletJSON(w)
+			return
+		}
+		posts.Add(1)
+		json.NewEncoder(w).Encode(paymentJSON(bolt, hash, "", "pending", 21000, "another-operation"))
+	})
+	_, err := c.CreateInvoice(context.Background(), InvoiceRequest{AmountSat: 21, Expiry: 300, ExternalID: "purchase-1"})
+	if err == nil || !IsUnknown(err) {
+		t.Fatalf("foreign external ID must leave the create outcome unknown: %v", err)
+	}
+	if posts.Load() != 1 {
+		t.Fatal("create was retried or skipped")
+	}
+}
+
+func TestPayInvoiceExternalIDMismatchIsUnknown(t *testing.T) {
+	bolt, hash, pre := testInvoice(t, 21000)
+	var posts atomic.Int32
+	c, _ := testClient(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet {
+			walletJSON(w)
+			return
+		}
+		posts.Add(1)
+		json.NewEncoder(w).Encode(paymentJSON(bolt, hash, pre, "success", -21000, "another-payout"))
+	})
+	_, err := c.PayInvoice(context.Background(), bolt, "payout-1")
+	if err == nil || !IsUnknown(err) {
+		t.Fatalf("foreign external ID must leave the send outcome unknown: %v", err)
+	}
+	if posts.Load() != 1 {
+		t.Fatal("send was retried or skipped")
+	}
+}
+
+func TestLookupExternalIDRecoversExactlyOneWalletPayment(t *testing.T) {
+	bolt, hash, _ := testInvoice(t, 21000)
+	var lists atomic.Int32
+	c, _ := testClient(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.Path != "/proxy/api/v1/payments" {
+			t.Errorf("unexpected recovery request: %s %s", r.Method, r.URL.Path)
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		if r.Header.Get("X-Api-Key") != "test-invoice-key" {
+			t.Error("recovery used a spending credential")
+		}
+		if got := r.URL.Query().Get("external_id"); got != "purchase-1" {
+			t.Errorf("external_id query = %q", got)
+		}
+		if got := r.URL.Query().Get("limit"); got != "2" {
+			t.Errorf("limit query = %q", got)
+		}
+		lists.Add(1)
+		json.NewEncoder(w).Encode([]map[string]any{paymentJSON(bolt, hash, "", "pending", 21000)})
+	})
+	p, err := c.LookupExternalID(context.Background(), "purchase-1", Incoming)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.PaymentHash != hash || p.ExternalID != "purchase-1" || p.Status != "pending" {
+		t.Fatalf("wrong recovered payment: %#v", p)
+	}
+	if lists.Load() != 1 {
+		t.Fatal("external-id lookup was retried or skipped")
+	}
+}
+
+func TestLookupExternalIDRefusesAmbiguousOrUnboundResults(t *testing.T) {
+	bolt, hash, _ := testInvoice(t, 21000)
+	for _, tc := range []struct {
+		name    string
+		results func() []map[string]any
+	}{
+		{"none", func() []map[string]any { return nil }},
+		{"duplicate", func() []map[string]any {
+			return []map[string]any{paymentJSON(bolt, hash, "", "pending", 21000), paymentJSON(bolt, hash, "", "pending", 21000)}
+		}},
+		{"foreign-id-only", func() []map[string]any {
+			return []map[string]any{paymentJSON(bolt, hash, "", "pending", 21000, "other")}
+		}},
+		{"foreign-wallet", func() []map[string]any {
+			p := paymentJSON(bolt, hash, "", "pending", 21000)
+			p["wallet_id"] = "other"
+			return []map[string]any{p}
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c, _ := testClient(t, func(w http.ResponseWriter, r *http.Request) {
+				json.NewEncoder(w).Encode(tc.results())
+			})
+			if _, err := c.LookupExternalID(context.Background(), "purchase-1", Incoming); err == nil {
+				t.Fatal("ambiguous or unbound external-id lookup accepted")
+			}
+		})
+	}
+}
+
 func TestUnsafeEndpointAndNetworkRefused(t *testing.T) {
 	for _, base := range []string{"http://example.com", "https://user:pass@example.com", "https://example.com?key=x", "https://example.com/#fragment", "file:///tmp/socket"} {
 		if _, err := New(Config{BaseURL: base, WalletID: "wallet-a", InvoiceKey: "key", Network: "bc"}); err == nil {
@@ -409,7 +516,7 @@ func TestSendProofMismatchRetainsUnknownOutcome(t *testing.T) {
 			walletJSON(w)
 			return
 		}
-		json.NewEncoder(w).Encode(paymentJSON(bolt, hash, strings.Repeat("f", 64), "success", -1000))
+		json.NewEncoder(w).Encode(paymentJSON(bolt, hash, strings.Repeat("f", 64), "success", -1000, "payout"))
 	})
 	if _, err := c.PayInvoice(context.Background(), bolt, "payout"); err == nil || !IsUnknown(err) {
 		t.Fatal("unverified outgoing success was accepted or treated as definite failure")
